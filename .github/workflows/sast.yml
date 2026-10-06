@@ -1,0 +1,79 @@
+name: "[Security] SAST"
+
+# Findings are report-only and triaged from the uploaded artifact.
+# A scanner that fails to run or produce a report fails the workflow.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-sast-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  semgrep:
+    name: SAST — Semgrep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run Semgrep
+        env:
+          SEMGREP_VERSION: 1.176.1
+          SEMGREP_SEND_METRICS: 'off'
+        run: |
+          set -euo pipefail
+          pipx install "semgrep==${SEMGREP_VERSION}"
+          semgrep scan --config p/ci --config p/security-audit \
+            --exclude node_modules --exclude .git \
+            --metrics off \
+            --json --output semgrep-report.json \
+            .
+          python3 - <<'PYEOF' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from collections import Counter
+          report = json.load(open('semgrep-report.json'))
+          results = report['results']
+          errors = [e for e in report['errors'] if e.get('level') == 'error']
+          print('## Semgrep findings')
+          print(f"Total: {len(results)}")
+          for sev, n in Counter(r['extra']['severity'] for r in results).most_common():
+              print(f"- {sev}: {n}")
+          if errors:
+              raise SystemExit(f"Semgrep reported {len(errors)} fatal errors")
+          PYEOF
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: semgrep-report
+          path: semgrep-report.json
+          if-no-files-found: error
+          retention-days: 90
+
+  sast:
+    name: SOC2 SAST
+    if: always()
+    needs: [semgrep]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      SEMGREP_RESULT: ${{ needs.semgrep.result }}
+    steps:
+      - name: Check scanner completion
+        run: |
+          set -euo pipefail
+          printf 'Semgrep: %s\n' "$SEMGREP_RESULT"
+          if [ "$SEMGREP_RESULT" != 'success' ]; then
+            echo 'The SAST scanner must complete successfully.' >&2
+            exit 1
+          fi
+          echo 'SAST scan completed. Findings remain report-only.' >> "$GITHUB_STEP_SUMMARY"
